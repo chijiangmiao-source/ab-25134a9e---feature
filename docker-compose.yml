@@ -1,0 +1,60 @@
+# Seafloor signed-tree-head checkpoint service.
+#
+#   docker compose up --build -d api            # start API on host port
+#   docker compose run --rm verify              # run acceptance service
+#   docker compose up --build --abort-on-container-exit --exit-code-from verify verify
+#
+# Host publish address/port are configurable:
+#   API_PUBLISH_HOST=0.0.0.0 API_PUBLISH_PORT=9090 docker compose up -d api
+
+name: seafloor-checkpoints
+
+services:
+  api:
+    image: seafloor-checkpoint:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      args:
+        IMAGE_TAG: ${IMAGE_TAG:-dev}
+    environment:
+      API_HOST: "0.0.0.0"
+      API_PORT: "8080"
+      DB_PATH: /data/checkpoints.db
+    ports:
+      # configurable host address + host port -> container 8080
+      - "${API_PUBLISH_HOST:-0.0.0.0}:${API_PUBLISH_PORT:-18080}:8080"
+    volumes:
+      - checkpoint-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3); assert r.status==200 and json.load(r)['status']=='ok'"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+
+  # Executable acceptance service: runs HTTP smoke observations (first
+  # checkpoint, legal extension, forged extension), interleaved algorithm
+  # and image-build checks, then exits non-zero if anything failed.
+  verify:
+    image: seafloor-checkpoint:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      args:
+        IMAGE_TAG: ${IMAGE_TAG:-dev}
+    command: ["python", "/app/acceptance/harness.py"]
+    environment:
+      API_BASE: http://api:8080
+      DB_PATH: /data/checkpoints.db
+    volumes:
+      - checkpoint-data:/data
+      # Optional: lets the harness restart the api container to prove
+      # checkpoints/forks survive restart. Absent socket -> graceful skip.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  checkpoint-data:
