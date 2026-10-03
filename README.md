@@ -85,6 +85,48 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
 
 另有 `GET /healthz` 与 `GET /logs`。
 
+### `POST /logs/{logId}/receipts`
+
+把一条采集样本与本日志**已保存的检查点**绑定为不可变的可复查回执。请求体
+（hex 字符串；`inclusion_proof` 为 hex 数组）：
+
+```json
+{
+  "receipt_id":      "<调用方指定的非空回执标识，可打印 ASCII，≤256 字节，不含 '/'>",
+  "tree_size":       4,
+  "leaf_index":      2,
+  "leaf_data":       "<样本原始字节，hex；服务端按 RFC 9162 计算 HASH(0x00||d) 叶哈希>",
+  "inclusion_proof": ["<32 字节证明节点，hex>", "..."]
+}
+```
+
+裁决规则（全部校验在任何写入之前完成，失败不留记录）：
+
+| 情形 | 状态码 | `error.code` / `result` |
+|---|---|---|
+| 核验通过并首次落库 | 201 | `result=sealed` |
+| 完全相同内容的重传（幂等） | 200 | `result=already_sealed`，返回原回执 |
+| 同一 `receipt_id` 改换样本、位置、目标检查点或证明 | 409 | `receipt_conflict`（details 列出分歧字段），原回执不变 |
+| 目标大小没有已保存检查点 | 409 | `checkpoint_not_found` |
+| 错误索引、错误样本字节、截断/伪造包含证明 | 400 | `invalid_inclusion_proof` |
+| 字段缺失/长度错误/hex 非法/索引越界 | 400 | `missing_fields` / `invalid_field` |
+| 日志从不存在 | 404 | `log_not_found` |
+
+要点：
+
+* `tree_size` **必须恰好等于**本日志已保存的某个检查点——可以是当前头，也可以
+  是已被更大树取代的**历史检查点**；服务端用该检查点的根哈希按 RFC 9162
+  （§2.1.6）核验 `leaf_index` 处的包含关系。
+* 已封存分叉（`fork_sealed`）的日志**仍可读取和提交**针对既有可信检查点的回执；
+  该接口不改变检查点推进、分叉封存的任何既有裁决语义。
+* 回执只增不改（append-only），目标检查点快照随回执一并固化。
+
+### `GET /logs/{logId}/receipts/{receiptId}`
+
+返回回执：`target_checkpoint`（`tree_size` / `root_hash` / `timestamp_ms`
+摘要）、`leaf_hash`、`leaf_index`、`inclusion_proof` 节点与封存时间；
+日志推进或分叉封存后仍可回读。未知回执为 404 `receipt_not_found`。
+
 ## 持久化与并发
 
 * 命名卷 `checkpoint-data` 上的 SQLite，`PRAGMA synchronous=FULL`、WAL 日志；
@@ -93,6 +135,8 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
 * 进程内可重入锁串行化"读取-裁决-写入"区间；并发相同扩展恰好一次落库，所有
   调用方拿到同一裁决。
 * `forks` 表对 `(log_id, rival_sig)` 去重并只保留首个证据。
+* `receipts` 表对 `(log_id, receipt_id)` 唯一且只增不改；包含证明核验通过后才在
+  单条 `BEGIN IMMEDIATE` 事务中插入，重复标识先读后判（幂等/冲突）。
 
 ## 验收服务 `verify`
 
@@ -107,8 +151,10 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
    CPython 版本；挂载 `/var/run/docker.sock` 时还会核对 api/verify 同源镜像）；
 6. 同尺寸分叉冒烟：不同根/密钥的已验签对手头封存证据、第二个对手头不覆盖首证、
    封存后拒绝推进、伪造签名不留证据；
-7. 直接只读核验 SQLite 持久化记录；挂载 Docker socket 时重启 `api` 容器后
-   重新查询可信检查点与分叉记录。
+7. 回执冒烟：历史检查点绑定、幂等重传、换样本/位置/目标/证明的 `receipt_conflict`、
+   错误索引与截断/伪造证明不留记录、封存分叉日志上的提交与回读、日志推进后的回读；
+8. 直接只读核验 SQLite 持久化记录；挂载 Docker socket 时重启 `api` 容器后
+   重新查询可信检查点、分叉记录与回执。
 
 ## 本地开发（无 Docker）
 

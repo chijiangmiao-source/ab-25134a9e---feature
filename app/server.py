@@ -2,13 +2,18 @@
 
 Endpoints
 ---------
-GET  /healthz                                 liveness + storage probe
-GET  /logs                                    list known log ids
-GET  /logs/{logId}                            trusted head, status, first fork
-POST /logs/{logId}/checkpoints                submit a signed checkpoint
+GET  /healthz                                         liveness + storage probe
+GET  /logs                                            list known log ids
+GET  /logs/{logId}                                    trusted head, status, first fork
+POST /logs/{logId}/checkpoints                        submit a signed checkpoint
+POST /logs/{logId}/receipts                           bind a sample to a saved
+                                                       checkpoint via RFC 9162
+                                                       inclusion proof
+GET  /logs/{logId}/receipts/{receiptId}               read an immutable receipt
 
-All validation (shape, signature, consistency proof) completes before any
-durable write, so rejected submissions leave no partial state behind.
+All validation (shape, signature, consistency/inclusion proofs) completes
+before any durable write, so rejected submissions leave no partial state
+behind.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ from .storage import Store, now_ms
 
 MAX_BODY_BYTES = 64 * 1024
 MAX_PROOF_NODES = 64  # more than ceil(log2(u64 max size)) + 1
+MAX_RECEIPT_ID_LEN = 256
+MAX_RECEIPT_SAMPLE_BYTES = MAX_BODY_BYTES
 
 
 class Submission:
@@ -40,6 +47,20 @@ class Submission:
         self.root_hash = root_hash
         self.signature = signature
         self.consistency = consistency
+
+
+class ReceiptRequest:
+    __slots__ = ("receipt_id", "tree_size", "leaf_index",
+                 "leaf_data", "leaf_hash", "proof")
+
+    def __init__(self, receipt_id, tree_size, leaf_index,
+                 leaf_data, leaf_hash, proof):
+        self.receipt_id = receipt_id
+        self.tree_size = tree_size
+        self.leaf_index = leaf_index
+        self.leaf_data = leaf_data
+        self.leaf_hash = leaf_hash
+        self.proof = proof
 
 
 class ApiError(Exception):
@@ -166,6 +187,105 @@ def parse_submission(log_id: str, body: bytes) -> Submission:
 
     return Submission(public_key, tree_size, timestamp_ms,
                       root_hash, signature, proof)
+
+
+def parse_receipt_request(body: bytes) -> ReceiptRequest:
+    """Validate the JSON shape of a receipt submission.
+
+    Inclusion against a *saved* checkpoint is performed later by the service
+    (it needs durable state); this function only does stateless checks and
+    hashes the raw sample to its RFC 9162 leaf hash.
+    """
+    if len(body) > MAX_BODY_BYTES:
+        raise ApiError(413, "body_too_large",
+                       f"request body exceeds {MAX_BODY_BYTES} bytes")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ApiError(400, "invalid_json", f"request body is not valid JSON: {exc}")
+    if not isinstance(payload, dict):
+        raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+    required = ("receipt_id", "tree_size", "leaf_index",
+                "leaf_data", "inclusion_proof")
+    missing = [f for f in required if f not in payload]
+    if missing:
+        raise ApiError(400, "missing_fields",
+                       "missing required fields", {"fields": missing})
+
+    receipt_id = payload["receipt_id"]
+    if not isinstance(receipt_id, str) or not receipt_id:
+        raise ApiError(400, "invalid_field",
+                       "receipt_id must be a non-empty string",
+                       {"field": "receipt_id"})
+    try:
+        rid_raw = receipt_id.encode("ascii")
+    except UnicodeEncodeError:
+        raise ApiError(400, "invalid_field",
+                       "receipt_id must be printable ASCII (0x20-0x7E)",
+                       {"field": "receipt_id"})
+    if len(rid_raw) > MAX_RECEIPT_ID_LEN \
+            or not all(0x20 <= b <= 0x7E for b in rid_raw):
+        raise ApiError(400, "invalid_field",
+                       f"receipt_id must be printable ASCII and at most"
+                       f" {MAX_RECEIPT_ID_LEN} bytes",
+                       {"field": "receipt_id", "got_bytes": len(rid_raw)})
+    if b"/" in rid_raw:
+        # A literal path separator would make /receipts/{receiptId}
+        # unaddressable; percent-encoded slash (%2F) is still allowed.
+        raise ApiError(400, "invalid_field",
+                       "receipt_id must not contain '/'",
+                       {"field": "receipt_id"})
+
+    tree_size = payload["tree_size"]
+    if isinstance(tree_size, bool) or not isinstance(tree_size, int):
+        raise ApiError(400, "invalid_field", "tree_size must be an integer",
+                       {"field": "tree_size"})
+    if not (1 <= tree_size <= 0xFFFFFFFFFFFFFFFF):
+        raise ApiError(400, "invalid_field",
+                       "tree_size must be in [1, 2^64-1]",
+                       {"field": "tree_size"})
+
+    leaf_index = payload["leaf_index"]
+    if isinstance(leaf_index, bool) or not isinstance(leaf_index, int):
+        raise ApiError(400, "invalid_field", "leaf_index must be an integer",
+                       {"field": "leaf_index"})
+    if not (0 <= leaf_index < tree_size):
+        raise ApiError(400, "invalid_field",
+                       "leaf_index must satisfy 0 <= leaf_index < tree_size",
+                       {"field": "leaf_index", "tree_size": tree_size})
+
+    leaf_data = _b16(payload["leaf_data"], "leaf_data")
+    if not leaf_data:
+        raise ApiError(400, "invalid_field",
+                       "leaf_data must decode to at least one byte",
+                       {"field": "leaf_data"})
+    if len(leaf_data) > MAX_RECEIPT_SAMPLE_BYTES:
+        raise ApiError(400, "invalid_field",
+                       f"leaf_data exceeds {MAX_RECEIPT_SAMPLE_BYTES} bytes",
+                       {"field": "leaf_data", "got_bytes": len(leaf_data)})
+
+    proof_raw = payload["inclusion_proof"]
+    if not isinstance(proof_raw, list):
+        raise ApiError(400, "invalid_field",
+                       "inclusion_proof must be an array of hex strings",
+                       {"field": "inclusion_proof"})
+    if len(proof_raw) > MAX_PROOF_NODES:
+        raise ApiError(400, "proof_too_large",
+                       f"inclusion proof has more than {MAX_PROOF_NODES} nodes",
+                       {"got": len(proof_raw)})
+    proof = []
+    for i, node in enumerate(proof_raw):
+        raw = _b16(node, f"inclusion_proof[{i}]")
+        if len(raw) != 32:
+            raise ApiError(400, "invalid_field",
+                           "inclusion_proof entries must decode to 32 bytes",
+                           {"field": f"inclusion_proof[{i}]",
+                            "got_bytes": len(raw)})
+        proof.append(raw)
+
+    return ReceiptRequest(receipt_id, tree_size, leaf_index,
+                          leaf_data, merkle.hash_leaf(leaf_data), proof)
 
 
 class Service:
@@ -340,6 +460,138 @@ class Service:
             "fork": _fork_payload(fork),
         }
 
+    # ------------------------------------------------------------ receipts
+
+    def submit_receipt(self, log_id: str, req: ReceiptRequest) -> tuple[int, dict]:
+        store = self.store
+        # Receipt reads/adjudication never touch checkpoint state, so the
+        # read-verify-write section only needs the same process-wide
+        # serialisation as checkpoint submission.
+        with store.lock:
+            current = store.get_log(log_id)
+            if current is None:
+                raise ApiError(404, "log_not_found",
+                               f"no checkpoint has ever been accepted for"
+                               f" log {log_id!r}")
+
+            # An existing receipt id is immutable: identical retries return
+            # the original receipt, any other reuse is a conflict.  This is
+            # adjudicated before proof verification so a malformed retry can
+            # neither overwrite nor shadow the committed verdict.
+            existing = store.get_receipt(log_id, req.receipt_id)
+            if existing is not None:
+                same, diffs = _same_receipt(existing, req)
+                if same:
+                    return 200, self._receipt_payload(existing, "already_sealed")
+                raise ApiError(
+                    409, "receipt_conflict",
+                    "receipt_id was already committed with different content;"
+                    " receipts are immutable and the original receipt is"
+                    " unchanged",
+                    {"receipt_id": req.receipt_id, "differing_fields": diffs})
+
+            # The target size must match a checkpoint the log actually
+            # published -- a historical one or the current head, on active
+            # and fork-sealed logs alike.
+            cp = store.get_checkpoint(log_id, req.tree_size)
+            if cp is None:
+                raise ApiError(
+                    409, "checkpoint_not_found",
+                    f"this log has no saved checkpoint at tree size"
+                    f" {req.tree_size}; receipts may only bind to published"
+                    f" checkpoints",
+                    {"tree_size": req.tree_size,
+                     "trusted_tree_size": current.tree_size})
+
+            root = bytes(cp["root_hash"])
+            try:
+                merkle.verify_inclusion(
+                    req.leaf_hash, req.leaf_index,
+                    cp["tree_size"], root, req.proof,
+                )
+            except ValueError as exc:
+                raise ApiError(
+                    400, "invalid_inclusion_proof",
+                    f"inclusion proof failed: {exc}",
+                    {"tree_size": cp["tree_size"],
+                     "root_hash": root.hex(),
+                     "leaf_index": req.leaf_index,
+                     "proof_nodes": len(req.proof)})
+
+            try:
+                store.save_receipt(log_id, req, cp, now_ms())
+            except RuntimeError:
+                # A concurrent request committed the same receipt id first;
+                # re-read and apply the same idempotency/conflict verdict.
+                winner = store.get_receipt(log_id, req.receipt_id)
+                if winner is not None:
+                    same, _diffs = _same_receipt(winner, req)
+                    if same:
+                        return 200, self._receipt_payload(
+                            winner, "already_sealed")
+                raise ApiError(
+                    409, "receipt_conflict",
+                    "a concurrent submission committed this receipt_id with"
+                    " different content; the original receipt is unchanged",
+                    {"receipt_id": req.receipt_id})
+            saved = store.get_receipt(log_id, req.receipt_id)
+            return 201, self._receipt_payload(saved, "sealed")
+
+    def read_receipt(self, log_id: str, receipt_id: str) -> dict:
+        current = self.store.get_log(log_id)
+        if current is None:
+            raise ApiError(404, "log_not_found",
+                           f"no checkpoint has ever been accepted for"
+                           f" log {log_id!r}")
+        row = self.store.get_receipt(log_id, receipt_id)
+        if row is None:
+            raise ApiError(404, "receipt_not_found",
+                           f"no receipt {receipt_id!r} has been committed for"
+                           f" log {log_id!r}")
+        # Receipts stay readable on fork-sealed logs.
+        return self._receipt_payload(row, "sealed")
+
+    @staticmethod
+    def _receipt_payload(row, result: str) -> dict:
+        try:
+            proof = json.loads(row["proof"])
+        except (ValueError, TypeError):
+            proof = []
+        return {
+            "result": result,
+            "log_id": row["log_id"],
+            "receipt_id": row["receipt_id"],
+            "created_at": row["created_at"],
+            "target_checkpoint": {
+                "tree_size": row["target_size"],
+                "root_hash": bytes(row["root_hash"]).hex(),
+                "timestamp_ms": row["timestamp_ms"],
+            },
+            "leaf_hash": bytes(row["leaf_hash"]).hex(),
+            "leaf_index": row["leaf_index"],
+            "inclusion_proof": proof,
+        }
+
+
+def _same_receipt(row, req: ReceiptRequest) -> tuple[bool, list[str]]:
+    """Compare a committed receipt row with a new request; list diffs."""
+    diffs = []
+    if row["target_size"] != req.tree_size:
+        diffs.append("tree_size")
+    if row["leaf_index"] != req.leaf_index:
+        diffs.append("leaf_index")
+    if bytes(row["leaf_data"]) != req.leaf_data:
+        diffs.append("leaf_data")
+    if bytes(row["leaf_hash"]) != req.leaf_hash:
+        diffs.append("leaf_hash")
+    try:
+        committed_proof = json.loads(row["proof"])
+    except (ValueError, TypeError):
+        committed_proof = None
+    if committed_proof != [n.hex() for n in req.proof]:
+        diffs.append("inclusion_proof")
+    return (not diffs), diffs
+
 
 def _fork_payload(row) -> dict | None:
     if row is None:
@@ -406,6 +658,13 @@ class Handler(BaseHTTPRequestHandler):
                 _valid_log_id(log_id)
                 self._send_json(200, self.server.service.describe_log(log_id))
                 return
+            if len(parts) == 4 and parts[0] == "logs" \
+                    and parts[2] == "receipts":
+                log_id, receipt_id = parts[1], parts[3]
+                _valid_log_id(log_id)
+                self._send_json(
+                    200, self.server.service.read_receipt(log_id, receipt_id))
+                return
             self._send_error(ApiError(404, "not_found", "unknown route"))
         except ApiError as err:
             self._send_error(err)
@@ -418,9 +677,10 @@ class Handler(BaseHTTPRequestHandler):
             parts = [unquote(p) for p in urlsplit(self.path).path.split("/")
                      if p]
             if len(parts) != 3 or parts[0] != "logs" \
-                    or parts[2] != "checkpoints":
+                    or parts[2] not in ("checkpoints", "receipts"):
                 self._send_error(ApiError(404, "not_found",
-                    "POST target must be /logs/{logId}/checkpoints"))
+                    "POST target must be /logs/{logId}/checkpoints"
+                    " or /logs/{logId}/receipts"))
                 return
             log_id = parts[1]
             _valid_log_id(log_id)
@@ -436,8 +696,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(413, "body_too_large",
                                f"request body exceeds {MAX_BODY_BYTES} bytes")
             body = self.rfile.read(length)
-            sub = parse_submission(log_id, body)
-            status, payload = self.server.service.submit(log_id, sub)
+            if parts[2] == "receipts":
+                req = parse_receipt_request(body)
+                status, payload = self.server.service.submit_receipt(
+                    log_id, req)
+            else:
+                sub = parse_submission(log_id, body)
+                status, payload = self.server.service.submit(log_id, sub)
             self._send_json(status, payload)
         except ApiError as err:
             self._send_error(err)

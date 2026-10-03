@@ -8,6 +8,7 @@ the same verdict the winner got.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -56,6 +57,29 @@ CREATE TABLE IF NOT EXISTS forks (
     proof            BLOB NOT NULL,
     created_at       INTEGER NOT NULL,
     UNIQUE(log_id, rival_sig)
+);
+
+-- Immutable review receipts bind a raw sample to a *published* checkpoint via
+-- an RFC 9162 inclusion proof.  Rows are append-only: there is deliberately no
+-- update or delete path, and the target checkpoint snapshot is copied in so a
+-- receipt stays fully readable even from a fork-sealed log.
+CREATE TABLE IF NOT EXISTS receipts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_id       TEXT NOT NULL REFERENCES logs(log_id),
+    receipt_id   TEXT NOT NULL,
+    -- snapshot of the targeted published checkpoint
+    target_size  INTEGER NOT NULL,
+    root_hash    BLOB NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    public_key   BLOB NOT NULL,
+    signature    BLOB NOT NULL,
+    -- committed leaf
+    leaf_index   INTEGER NOT NULL,
+    leaf_hash    BLOB NOT NULL,
+    leaf_data    BLOB NOT NULL,
+    proof        TEXT NOT NULL,  -- JSON array of hex proof nodes
+    created_at   INTEGER NOT NULL,
+    UNIQUE(log_id, receipt_id)
 );
 """
 
@@ -126,6 +150,69 @@ class Store:
                     (log_id,),
                 ).fetchall()
             )
+
+    def get_checkpoint(self, log_id: str, tree_size: int):
+        """Return the saved checkpoint at exactly ``tree_size`` or None.
+
+        Historical (superseded) checkpoints are returned too: receipts may
+        bind to any checkpoint the log has ever published, regardless of the
+        current head or fork-sealed status.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM checkpoints WHERE log_id=? AND tree_size=?",
+                (log_id, tree_size),
+            ).fetchone()
+
+    def get_receipt(self, log_id: str, receipt_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM receipts WHERE log_id=? AND receipt_id=?",
+                (log_id, receipt_id),
+            ).fetchone()
+
+    def save_receipt(self, log_id: str, req: "ReceiptRequest", cp: sqlite3.Row,
+                     now_ms: int) -> None:
+        """Atomically persist an already-verified immutable receipt.
+
+        Raises RuntimeError if another transaction committed the same
+        (log_id, receipt_id) first; the caller re-reads to adjudicate
+        idempotent replay vs. conflicting reuse of the receipt id.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                exists = self._conn.execute(
+                    "SELECT 1 FROM receipts WHERE log_id=? AND receipt_id=?",
+                    (log_id, req.receipt_id),
+                ).fetchone()
+                if exists:
+                    self._conn.execute("ROLLBACK")
+                    raise RuntimeError("receipt already exists")
+                self._conn.execute(
+                    "INSERT INTO receipts (log_id, receipt_id, target_size,"
+                    " root_hash, timestamp_ms, public_key, signature,"
+                    " leaf_index, leaf_hash, leaf_data, proof, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        log_id,
+                        req.receipt_id,
+                        cp["tree_size"],
+                        cp["root_hash"],
+                        cp["timestamp_ms"],
+                        cp["public_key"],
+                        cp["signature"],
+                        req.leaf_index,
+                        req.leaf_hash,
+                        req.leaf_data,
+                        json.dumps([n.hex() for n in req.proof]),
+                        now_ms,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def freeze_first(self, log_id: str, sub: "Submission", now_ms: int) -> None:
         """Atomically freeze the key and anchor the first checkpoint."""
