@@ -455,6 +455,200 @@ def smoke_fork_path() -> None:
           f"{status} {payload}")
 
 
+# ------------------------------------------------------------ receipts
+
+def smoke_receipts_path() -> None:
+    section("HTTP smoke: immutable review receipts")
+    log_id = "smoke-receipts"
+    seed_r, key_r = ed25519.generate_keypair()
+
+    # Raw sample bytes; tree leaves are their RFC 9162 leaf hashes.
+    samples = [b"obs-sample-%02d" % i for i in range(10)]
+    leaves = [merkle.hash_leaf(s) for s in samples]
+    roots = {n: merkle.tree_hash(leaves[:n]) for n in range(1, 11)}
+
+    def body(size, index, sample=None, proof=None):
+        sample = samples[index] if sample is None else sample
+        nodes = merkle.inclusion_proof(leaves[:size], index) if proof is None \
+            else proof
+        return {
+            "target_tree_size": size,
+            "leaf_index": index,
+            "leaf_data": sample.hex(),
+            "inclusion": [n.hex() for n in nodes],
+        }
+
+    # Publish checkpoints at sizes 4 -> 6 -> 8.
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints",
+                           checkpoint_body(key_r, seed_r, log_id, 4,
+                                           7_000, roots[4], []))
+    check("receipt log bootstrapped at size 4",
+          status == 201, f"{status} {payload}")
+
+    # 1. Bind a sample to the (currently head) checkpoint at size 4.
+    rbody = body(4, 1)
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/obs-1", rbody)
+    check("receipt bound to checkpoint (201 saved)",
+          status == 201 and payload.get("result") == "saved"
+          and payload["checkpoint"]["tree_size"] == 4
+          and payload["checkpoint"]["root_hash"] == roots[4].hex()
+          and payload["leaf_index"] == 1
+          and payload["leaf_hash"] == leaves[1].hex()
+          and payload["inclusion"] == rbody["inclusion"],
+          f"{status} {payload}")
+
+    # 2. Advance the log past the anchored checkpoint.
+    for size, prev, ts in ((6, 4, 7_100), (8, 6, 7_200)):
+        status, payload = http("POST", f"/logs/{log_id}/checkpoints",
+                               checkpoint_body(
+                                   key_r, seed_r, log_id, size, ts,
+                                   roots[size],
+                                   merkle.consistency_proof(prev, leaves[:size])))
+        check(f"log advanced to size {size}",
+              status == 200 and payload.get("result") == "trusted",
+              f"{status} {payload}")
+
+    # 3. Readback after the log moved on: the receipt is still anchored to
+    # the historical size-4 checkpoint.
+    status, payload = http("GET", f"/logs/{log_id}/receipts/obs-1")
+    check("receipt reads back anchored to history after log advance",
+          status == 200 and payload["checkpoint"]["tree_size"] == 4
+          and payload["checkpoint"]["root_hash"] == roots[4].hex()
+          and payload["leaf_hash"] == leaves[1].hex()
+          and payload["leaf_index"] == 1
+          and payload["inclusion"] == rbody["inclusion"],
+          f"{status} {payload}")
+
+    # 4. Another receipt against an intermediate historical checkpoint.
+    h6 = body(6, 5)
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/obs-hist6", h6)
+    check("receipt bound to intermediate saved checkpoint",
+          status == 201 and payload["checkpoint"]["tree_size"] == 6
+          and payload["checkpoint"]["root_hash"] == roots[6].hex(),
+          f"{status} {payload}")
+
+    # 5. Identical resubmission is idempotent, no second row.
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/obs-1", rbody)
+    check("identical receipt resubmission returns already_saved",
+          status == 200 and payload.get("result") == "already_saved"
+          and payload["leaf_hash"] == leaves[1].hex(),
+          f"{status} {payload}")
+
+    # 6. Same id, changed content -> explicit conflict (even when the new
+    # claim's own proof would fail against the claimed root).
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/obs-1",
+                           body(4, 1, sample=b"swapped-sample"))
+    check("changed sample conflicts",
+          status == 409 and payload["error"]["code"] == "receipt_conflict"
+          and "leaf_data" in payload["error"]["details"]["conflicts"],
+          f"{status} {payload}")
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/obs-1", body(4, 2))
+    check("changed leaf position conflicts",
+          status == 409 and payload["error"]["code"] == "receipt_conflict"
+          and "leaf_index" in payload["error"]["details"]["conflicts"],
+          f"{status} {payload}")
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/obs-1", body(6, 1))
+    check("changed target checkpoint conflicts",
+          status == 409 and payload["error"]["code"] == "receipt_conflict"
+          and "target_tree_size" in payload["error"]["details"]["conflicts"],
+          f"{status} {payload}")
+    tampered = body(4, 1)
+    tampered["inclusion"][0] = "00" * 32
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/obs-1", tampered)
+    check("changed proof conflicts",
+          status == 409 and payload["error"]["code"] == "receipt_conflict"
+          and "inclusion" in payload["error"]["details"]["conflicts"],
+          f"{status} {payload}")
+    # Original receipt survived the conflict attempts.
+    status, payload = http("GET", f"/logs/{log_id}/receipts/obs-1")
+    check("stored receipt unchanged after conflicts",
+          payload["checkpoint"]["tree_size"] == 4
+          and payload["leaf_hash"] == leaves[1].hex(), str(payload))
+
+    # 7. Failed verifications leave no record.
+    bad_index = body(4, 3)
+    bad_index["leaf_index"] = 4  # index == target size
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/bad-index",
+                           bad_index)
+    check("out-of-range leaf index rejected",
+          status == 400 and payload["error"]["code"] == "invalid_field",
+          f"{status} {payload}")
+
+    trunc = body(8, 3, proof=merkle.inclusion_proof(leaves[:8], 3)[:-1])
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/bad-proof", trunc)
+    check("truncated inclusion proof rejected",
+          status == 400 and payload["error"]["code"]
+          == "invalid_inclusion_proof", f"{status} {payload}")
+
+    forged = body(8, 3, sample=b"sample-not-in-tree",
+                  proof=merkle.inclusion_proof(leaves[:8], 3))
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/bad-sample",
+                           forged)
+    check("forged sample/proof rejected",
+          status == 400 and payload["error"]["code"]
+          == "invalid_inclusion_proof", f"{status} {payload}")
+
+    wrong_target = body(7, 0,
+                        proof=merkle.inclusion_proof(leaves[:7], 0))
+    status, payload = http("PUT", f"/logs/{log_id}/receipts/no-target",
+                           wrong_target)
+    check("target size without a saved checkpoint rejected",
+          status == 409 and payload["error"]["code"]
+          == "checkpoint_not_saved", f"{status} {payload}")
+
+    for rid in ("bad-index", "bad-proof", "bad-sample", "no-target"):
+        status, _ = http("GET", f"/logs/{log_id}/receipts/{rid}")
+        check(f"failed receipt {rid} left no record", status == 404)
+
+    status, payload = http("PUT", "/logs/no-such-log/receipts/x", body(4, 0))
+    check("receipt on unknown log is 404",
+          status == 404 and payload["error"]["code"] == "log_not_found",
+          f"{status} {payload}")
+    status, payload = http("GET", f"/logs/{log_id}/receipts/missing")
+    check("missing receipt is 404", status == 404, f"{status} {payload}")
+
+    # 8. A fork-sealed log still accepts and serves receipts against its
+    # already-trusted checkpoints.
+    seal_log = "smoke-receipt-fork"
+    seal_leaves = [merkle.hash_leaf(b"seal-%d" % i) for i in range(3)]
+    seal_root = merkle.tree_hash(seal_leaves)
+    status, payload = http("POST", f"/logs/{seal_log}/checkpoints",
+                           checkpoint_body(key_r, seed_r, seal_log, 3,
+                                           8_000, seal_root, []))
+    check("seal-scenario log bootstrapped", status == 201, f"{status} {payload}")
+    alt = merkle.hash_leaf(b"sealed-alt-view")
+    rival = {
+        "public_key": key_r.hex(),
+        "tree_size": 3,
+        "timestamp_ms": 8_001,
+        "root_hash": alt.hex(),
+        "signature": sign_raw(key_r, seed_r, seal_log, 3, 8_001, alt),
+        "consistency": [],
+    }
+    status, payload = http("POST", f"/logs/{seal_log}/checkpoints", rival)
+    check("seal-scenario log sealed",
+          status == 409 and payload["error"]["code"]
+          == "fork_evidence_sealed", f"{status} {payload}")
+
+    proof0 = merkle.inclusion_proof(seal_leaves, 0)
+    seal_receipt = {
+        "target_tree_size": 3,
+        "leaf_index": 0,
+        "leaf_data": b"seal-0".hex(),
+        "inclusion": [n.hex() for n in proof0],
+    }
+    status, payload = http("PUT", f"/logs/{seal_log}/receipts/kept",
+                           seal_receipt)
+    check("receipt accepted on sealed log against trusted checkpoint",
+          status == 201 and payload["checkpoint"]["root_hash"]
+          == seal_root.hex() and payload["leaf_index"] == 0,
+          f"{status} {payload}")
+    status, payload = http("GET", f"/logs/{seal_log}/receipts/kept")
+    check("receipt readable on sealed log",
+          status == 200 and payload["leaf_hash"]
+          == seal_leaves[0].hex(), f"{status} {payload}")
+
+
 # ------------------------------------------------------------ durability
 
 def durability_check() -> None:
@@ -472,11 +666,33 @@ def durability_check() -> None:
     n_fork = conn.execute(
         "SELECT COUNT(*) FROM forks WHERE log_id=?",
         ("smoke-fork",)).fetchone()[0]
+    n_receipts = conn.execute(
+        "SELECT COUNT(*) FROM receipts WHERE log_id=?",
+        ("smoke-receipts",)).fetchone()[0]
+    receipt_row = conn.execute(
+        "SELECT r.target_size, r.leaf_index, r.leaf_hash, r.target_root,"
+        " c.root_hash FROM receipts r JOIN checkpoints c"
+        " ON c.log_id=r.log_id AND c.tree_size=r.target_size"
+        " WHERE r.log_id=? AND r.receipt_id=?",
+        ("smoke-receipts", "obs-1")).fetchone()
+    sealed_receipt = conn.execute(
+        "SELECT COUNT(*) FROM receipts WHERE log_id=?",
+        ("smoke-receipt-fork",)).fetchone()[0]
     check("trusted head persisted (size 8, active)",
           n_primary == (8, "active"), str(n_primary))
     check("accepted checkpoints persisted (4,6,8)",
           n_cps == (3, 8), str(n_cps))
     check("exactly one fork record sealed", n_fork == 1, str(n_fork))
+    check("immutable receipts persisted (obs-1, obs-hist6)",
+          n_receipts == 2, str(n_receipts))
+    check("receipt stays bound to historical size-4 checkpoint in storage",
+          receipt_row is not None
+          and receipt_row[0] == 4
+          and receipt_row[1] == 1
+          and receipt_row[3] == receipt_row[4],
+          str(tuple(receipt_row) if receipt_row else None))
+    check("receipt persisted on fork-sealed log",
+          sealed_receipt == 1, str(sealed_receipt))
     conn.close()
 
     if not _restart_api_via_docker():
@@ -492,6 +708,14 @@ def durability_check() -> None:
     check("fork record queryable after restart",
           status == 200 and payload["status"] == "fork_sealed"
           and payload["fork"] is not None, f"{status} {payload}")
+    status, payload = http("GET", "/logs/smoke-receipts/receipts/obs-1")
+    check("historical receipt queryable after restart",
+          status == 200 and payload["checkpoint"]["tree_size"] == 4
+          and payload["leaf_index"] == 1, f"{status} {payload}")
+    status, payload = http("GET", "/logs/smoke-receipt-fork/receipts/kept")
+    check("sealed-log receipt queryable after restart",
+          status == 200 and payload["checkpoint"]["tree_size"] == 3,
+          f"{status} {payload}")
 
 
 def _restart_api_via_docker() -> bool:
@@ -538,6 +762,7 @@ def main() -> int:
     smoke_extension_path()
     build_check()
     smoke_fork_path()
+    smoke_receipts_path()
     durability_check()
 
     print("\n=== summary ===")

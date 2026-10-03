@@ -83,6 +83,47 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
 返回可信树大小、根哈希、时间戳、冻结公钥、状态（`active` /
 `fork_sealed`）及首个分叉证据（`fork` 字段，含可信头与分叉头的完整快照与签名）。
 
+### `PUT /logs/{logId}/receipts/{receiptId}`
+
+把一个采集样本与**本日志已保存的某个检查点**绑定为不可变可复查回执。
+`receiptId` 为 1–128 字节可打印 ASCII（0x20–0x7E），在同一 `logId` 内唯一；
+请求体（JSON，hex 字符串）：
+
+```json
+{
+  "target_tree_size": 6,
+  "leaf_index": 2,
+  "leaf_data": "<样本原始字节，hex>",
+  "inclusion": ["<32 字节 RFC 9162 包含证明节点，hex>", "..."]
+}
+```
+
+裁决规则（全部校验先于任何写入，失败不留记录）：
+
+| 情形 | 状态码 | `error.code` / `result` |
+|---|---|---|
+| 核验通过且为该回执标识首次提交 | 201 | `result=saved` |
+| 完全相同内容重传（并发或串行） | 200 | `result=already_saved`，返回原回执 |
+| 同标识改换样本、叶序号、目标检查点或证明 | 409 | `receipt_conflict`，`details.conflicts` 定位差异字段，原回执不变 |
+| `target_tree_size` 不对应任何已保存检查点 | 409 | `checkpoint_not_saved` |
+| 错误索引 / 截断或伪造证明 / 样本不在树中 | 400 | `invalid_inclusion_proof` / `invalid_field` |
+| 日志从无检查点；回执标识不存在 | 404 | `log_not_found` / `receipt_not_found` |
+
+要点：
+
+* 系统只接受目标大小**恰好命中本日志已保存检查点**（历史检查点亦可，不要求是
+  当前头）的请求，并按该检查点行里的根哈希核验 RFC 9162 包含关系；请求自报根
+  哈希不被信任，分叉对手头永远不能成为锚点。
+* 服务端按 `HASH(0x00 || leaf_data)` 计算叶哈希，再用 `leaf_index`、
+  `target_tree_size`、检查点根与包含证明核验。
+* 已封存分叉（`fork_sealed`）的日志仍可读取，也仍可提交针对既有可信检查点的
+  回执；检查点推进/分叉裁决语义不受影响。
+
+### `GET /logs/{logId}/receipts/{receiptId}`
+
+返回目标检查点摘要（`tree_size` / `root_hash` / `timestamp_ms`）、叶哈希、
+叶序号与包含证明节点；日志推进后回读仍指向当初绑定的历史检查点。
+
 另有 `GET /healthz` 与 `GET /logs`。
 
 ## 持久化与并发
@@ -93,6 +134,8 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
 * 进程内可重入锁串行化"读取-裁决-写入"区间；并发相同扩展恰好一次落库，所有
   调用方拿到同一裁决。
 * `forks` 表对 `(log_id, rival_sig)` 去重并只保留首个证据。
+* `receipts` 表对 `(log_id, receipt_id)` 唯一且只插入、不更新：相同重传走原行，
+  内容冲突在写入前拒绝；封存日志的既有可信检查点仍可作为回执锚点。
 
 ## 验收服务 `verify`
 
@@ -107,8 +150,10 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
    CPython 版本；挂载 `/var/run/docker.sock` 时还会核对 api/verify 同源镜像）；
 6. 同尺寸分叉冒烟：不同根/密钥的已验签对手头封存证据、第二个对手头不覆盖首证、
    封存后拒绝推进、伪造签名不留证据；
-7. 直接只读核验 SQLite 持久化记录；挂载 Docker socket 时重启 `api` 容器后
-   重新查询可信检查点与分叉记录。
+7. 回执冒烟：历史检查点绑定、日志推进后回读、幂等重传、改换样本/位置/目标/
+   证明的冲突、错误索引与截断/伪造证明不留记录、封存日志仍可回执；
+8. 直接只读核验 SQLite 持久化记录（含回执）；挂载 Docker socket 时重启 `api`
+   容器后重新查询可信检查点、分叉记录与回执。
 
 ## 本地开发（无 Docker）
 

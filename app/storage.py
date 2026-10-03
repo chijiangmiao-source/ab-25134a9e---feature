@@ -8,6 +8,7 @@ the same verdict the winner got.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -57,6 +58,27 @@ CREATE TABLE IF NOT EXISTS forks (
     created_at       INTEGER NOT NULL,
     UNIQUE(log_id, rival_sig)
 );
+
+-- Immutable review receipts binding a caller-chosen receipt id to one leaf
+-- at one already-saved checkpoint.  Rows are inserted at most once per
+-- (log_id, receipt_id) and never updated: identical resubmissions return the
+-- stored row, divergent resubmissions are rejected as conflicts.
+CREATE TABLE IF NOT EXISTS receipts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_id       TEXT NOT NULL REFERENCES logs(log_id),
+    receipt_id   TEXT NOT NULL,
+    -- snapshot of the saved checkpoint this receipt was anchored to
+    target_size  INTEGER NOT NULL,
+    target_root  BLOB NOT NULL,
+    target_ts    INTEGER NOT NULL,
+    leaf_index   INTEGER NOT NULL,
+    leaf_hash    BLOB NOT NULL,
+    leaf_data    BLOB NOT NULL,
+    -- RFC 9162 inclusion path as a JSON array of lowercase hex strings
+    inclusion    BLOB NOT NULL,
+    created_at   INTEGER NOT NULL,
+    UNIQUE(log_id, receipt_id)
+);
 """
 
 
@@ -71,6 +93,25 @@ class LogState:
         self.status: str = row["status"]
         self.created_at: int = row["created_at"]
         self.updated_at: int = row["updated_at"]
+
+
+class ReceiptState:
+    __slots__ = (
+        "log_id", "receipt_id", "target_size", "target_root", "target_ts",
+        "leaf_index", "leaf_hash", "leaf_data", "inclusion", "created_at",
+    )
+
+    def __init__(self, row: sqlite3.Row):
+        self.log_id: str = row["log_id"]
+        self.receipt_id: str = row["receipt_id"]
+        self.target_size: int = row["target_size"]
+        self.target_root: bytes = bytes(row["target_root"])
+        self.target_ts: int = row["target_ts"]
+        self.leaf_index: int = row["leaf_index"]
+        self.leaf_hash: bytes = bytes(row["leaf_hash"])
+        self.leaf_data: bytes = bytes(row["leaf_data"])
+        self.inclusion: bytes = bytes(row["inclusion"])
+        self.created_at: int = row["created_at"]
 
 
 class Store:
@@ -126,6 +167,76 @@ class Store:
                     (log_id,),
                 ).fetchall()
             )
+
+    def get_checkpoint(self, log_id: str, tree_size: int) -> Optional[sqlite3.Row]:
+        """A saved checkpoint for this log at exactly ``tree_size``.
+
+        Any historically accepted size anchors receipts, including logs
+        later sealed for equivocation.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM checkpoints WHERE log_id = ? AND tree_size = ?",
+                (log_id, tree_size),
+            ).fetchone()
+
+    def get_receipt(self, log_id: str, receipt_id: str) -> Optional[ReceiptState]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM receipts WHERE log_id = ? AND receipt_id = ?",
+                (log_id, receipt_id),
+            ).fetchone()
+        return ReceiptState(row) if row else None
+
+    def save_receipt(self, log_id: str, receipt_id: str, target: sqlite3.Row,
+                     leaf_index: int, leaf_hash: bytes, leaf_data: bytes,
+                     inclusion: list[bytes], now_ms: int
+                     ) -> tuple[ReceiptState, bool]:
+        """Atomically persist an immutable, fully-verified receipt.
+
+        Returns ``(receipt, inserted)``: an identical-id resubmission races
+        are resolved inside one ``BEGIN IMMEDIATE`` transaction -- the loser
+        gets the stored row and ``inserted=False`` so the service can decide
+        between idempotent replay and content conflict.
+        """
+        proof_blob = json.dumps([n.hex() for n in inclusion]).encode()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM receipts WHERE log_id = ? AND receipt_id = ?",
+                    (log_id, receipt_id),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.execute("COMMIT")
+                    return ReceiptState(existing), False
+                cur = self._conn.execute(
+                    "INSERT INTO receipts (log_id, receipt_id, target_size,"
+                    " target_root, target_ts, leaf_index, leaf_hash, leaf_data,"
+                    " inclusion, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        log_id,
+                        receipt_id,
+                        target["tree_size"],
+                        target["root_hash"],
+                        target["timestamp_ms"],
+                        leaf_index,
+                        leaf_hash,
+                        leaf_data,
+                        proof_blob,
+                        now_ms,
+                    ),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM receipts WHERE id = ?",
+                    (cur.lastrowid,),
+                ).fetchone()
+                self._conn.execute("COMMIT")
+                return ReceiptState(row), True
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def freeze_first(self, log_id: str, sub: "Submission", now_ms: int) -> None:
         """Atomically freeze the key and anchor the first checkpoint."""
